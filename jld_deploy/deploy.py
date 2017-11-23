@@ -16,7 +16,7 @@ from jinja2 import Template
 
 
 JUPYTERLAB_REPO_URL = "https://github.com/lsst-sqre/jupyterlabdemo.git"
-EXECUTABLES = ["gcloud", "kubectl", "openssl"]
+EXECUTABLES = ["gcloud", "kubectl", "aws"]
 DEFAULT_ZONE = "us-central1-a"
 
 
@@ -179,8 +179,10 @@ class JupyterLabDeployment(object):
         if self._empty_param('session_db_url'):
             self.params[
                 'session_db_url'] = 'sqlite:////home/jupyter/jupyterhub.sqlite'
-        if self._empty_param('dhparam_bits'):
-            self.params['dhparam_bits'] = 2048
+        if self._empty_param('tls_dhparam'):
+            self._check_executable("openssl")
+            if self._empty_param('dhparam_bits'):
+                self.params['dhparam_bits'] = 2048
 
     def _get_repo(self):
         if not self.repo_url:
@@ -220,15 +222,20 @@ class JupyterLabDeployment(object):
         logging.info("About to run '%s'" % cmdstr)
 
     def _generate_dhparams(self):
-        bits = self.params['dhparam_bits']
-        cwd = os.getcwd()
-        os.chdir(self.directory)
-        ossl = self.executables["openssl"]
-        cmd = [ossl, "dhparam", str(bits)]
-        rc = self._run(cmd, capture=True)
-        dhp = rc.stdout.decode('utf-8')
-        self.params["dhparams"] = dhp
-        os.chdir(cwd)
+        if self._empty_param('tls_dhparam'):
+            bits = self.params['dhparam_bits']
+            cwd = os.getcwd()
+            os.chdir(self.directory)
+            ossl = self.executables["openssl"]
+            cmd = [ossl, "dhparam", str(bits)]
+            rc = self._run(cmd, capture=True)
+            dhp = rc.stdout.decode('utf-8')
+            self.params["dhparams"] = dhp
+            os.chdir(cwd)
+        else:
+            with open(self.params['tls_dhparam'], "r") as f:
+                dhp = f.read()
+                self.params["dhparams"] = dhp
 
     def encode_value(self, key):
         """Cache and return base64 representation of parameter value,
@@ -616,7 +623,8 @@ class JupyterLabDeployment(object):
             self._run_gcloud(["container", "clusters", "get-credentials",
                               name])
         self._switch_to_context(name)
-        self._run(["kubectl", "create", "namespace", namespace])
+        if namespace != "default":
+            self._run(["kubectl", "create", "namespace", namespace])
 
     def _switch_to_context(self, name):
         context = None
