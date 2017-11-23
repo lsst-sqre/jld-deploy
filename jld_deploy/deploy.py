@@ -2,6 +2,7 @@
 import argparse
 import base64
 import fnmatch
+import json
 import logging
 import os
 import os.path
@@ -178,6 +179,8 @@ class JupyterLabDeployment(object):
         if self._empty_param('session_db_url'):
             self.params[
                 'session_db_url'] = 'sqlite:////home/jupyter/jupyterhub.sqlite'
+        if self._empty_param('dhparam_bits'):
+            self.params['dhparam_bits'] = 2048
 
     def _get_repo(self):
         if not self.repo_url:
@@ -217,7 +220,7 @@ class JupyterLabDeployment(object):
         logging.info("About to run '%s'" % cmdstr)
 
     def _generate_dhparams(self):
-        bits = 256  # FIXME
+        bits = self.params['dhparam_bits']
         cwd = os.getcwd()
         os.chdir(self.directory)
         ossl = self.executables["openssl"]
@@ -319,8 +322,12 @@ class JupyterLabDeployment(object):
             if self.enable_logging:
                 self._create_logging_components()
             self._create_fileserver()
-            self.logging("Sleeping for investigation of working dir")
-            time.sleep(600)
+            self._create_fs_keepalive()
+            if self.enable_prepuller:
+                self._create_prepuller()
+            self._create_jupyterhub()
+            self._create_nginx()
+            self._create_dns_record()
 
     def _create_logging_components(self):
         logging.info("Creating logging components.")
@@ -346,7 +353,8 @@ class JupyterLabDeployment(object):
         directory = os.path.join(self.directory, "deployment", "fileserver")
         for c in ["jld-fileserver-storageclass.yml",
                   "jld-fileserver-physpvc.yml",
-                  "jld-fileserver-service.yml"]:
+                  "jld-fileserver-service.yml",
+                  "jld-fileserver-deployment.yml"]:
             self._run_kubectl_create(os.path.join(directory, c))
         ip = self._waitfor(self._get_fileserver_ip)
         ns = self.params["kubernetes_cluster_namespace"]
@@ -394,21 +402,191 @@ class JupyterLabDeployment(object):
                     return struct["spec"]["clusterIP"]
         return None
 
+    def _get_external_ip(self):
+        rc = self._run(["kubectl", "get", "svc", "jld-nginx",
+                        "--namespace=%s" %
+                        self.params['kubernetes_cluster_namespace'],
+                        "-o", "yaml"],
+                       check=False,
+                       capture=True)
+        if rc.stdout:
+            struct = yaml.load(rc.stdout.decode('utf-8'))
+            if "status" in struct and struct["status"]:
+                st = struct["status"]
+                if "loadBalancer" in st and st["loadBalancer"]:
+                    lb = st["loadBalancer"]
+                    if "ingress" in lb and lb["ingress"]:
+                        ng = lb["ingress"]
+                        return ng[0]["ip"]
+        return None
+
     def _destroy_fileserver(self):
         logging.info("Destroying fileserver.")
         ns = self.params["kubernetes_cluster_namespace"]
         for c in [["pvc", "jld-fileserver-home"],
                   ["pv", "jld-fileserver-home-%s" % ns],
+                  ["deployment", "jld-fileserver"],
                   ["service", "jld-fileserver"],
                   ["pvc", "jld-fileserver-physpvc"],
                   ["storageclass", "fast"]]:
             self._run_kubectl_delete(c)
 
+    def _create_fs_keepalive(self):
+        logging.info("Creating fs-keepalive")
+        self._run_kubectl_create(os.path.join(
+            self.directory,
+            "deployment",
+            "fs-keepalive",
+            "jld-keepalive-deployment.yml"
+        ))
+
+    def _destroy_fs_keepalive(self):
+        logging.info("Destroying fs-keepalive")
+        self._run_kubectl_delete(["deployment", "jld-keepalive"])
+
+    def _create_prepuller(self):
+        logging.info("Creating prepuller")
+        self._run_kubectl_create(os.path.join(
+            self.directory,
+            "deployment",
+            "prepuller",
+            "prepuller-daemonset.yml"
+        ))
+
+    def _destroy_prepuller(self):
+        logging.info("Destroying prepuller")
+        self._run_kubectl_delete(["daemonset", "prepuller"])
+
+    def _create_jupyterhub(self):
+        logging.info("Creating JupyterHub")
+        directory = os.path.join(self.directory, "deployment", "jupyterhub")
+        for c in ["jld-hub-service.yml", "jld-hub-physpvc.yml",
+                  "jld-hub-secrets.yml"]:
+            self._run_kubectl_create(os.path.join(directory, c))
+        cfdir = os.path.join(directory, "config")
+        cfnm = "jupyterhub_config"
+        self._run(['kubectl', 'create', 'configmap', 'jld-hub-config',
+                   "--from-file=%s" % os.path.join(cfdir, "%s.py" % cfnm),
+                   "--from-file=%s" % os.path.join(cfdir, "%s.d" % cfnm)])
+        self._run_kubectl_create(os.path.join(
+            directory, "jld-hub-deployment.yml"))
+
+    def _destroy_jupyterhub(self):
+        logging.info("Destroying JupyterHub")
+        for c in [["deployment", "jld-hub"],
+                  ["configmap", "jld-hub-config"],
+                  ["secret", "jld-hub"],
+                  ["pvc", "jld-hub-physpvc"],
+                  ["svc", "jld-hub"]]:
+            self._run_kubectl_delete(c)
+
+    def _create_nginx(self):
+        logging.info("Creating Nginx")
+        directory = os.path.join(self.directory, "deployment", "nginx")
+        for c in ["tls-secrets.yml",
+                  "nginx-service.yml",
+                  "nginx-deployment.yml"]:
+            self._run_kubectl_create(os.path.join(directory, c))
+
+    def _destroy_nginx(self):
+        logging.info("Destroying Nginx")
+        for c in [["deployment", "jld-nginx"],
+                  ["svc", "jld-nginx"],
+                  ["secret", "tls"]]:
+            self._run_kubectl_delete(c)
+
+    def _create_dns_record(self):
+        logging.info("Creating DNS record")
+        self._change_dns_record("create")
+
+    def _change_dns_record(self, action):
+        zoneid = self._get_aws_zone_id()
+        record = {
+            "Comment": "JupyterLab Demo %s/%s" % (
+                self.params['kubernetes_cluster_name'],
+                self.params['kubernetes_cluster_namespace'],
+            ),
+            "Changes": []
+        }
+        if action == "create":
+            record["Changes"] = self._generate_upsert_dns()
+        elif action == "delete":
+            record["Changes"] = self._generate_delete_dns()
+        else:
+            raise RuntimeError("DNS action must be 'create' or 'delete'")
+        changeset = os.path.join(self.directory, "rr-changeset.txt")
+        with open(changeset, "w") as f:
+            json.dump(record, f)
+        self._run(["aws", "route53", "change-resource-record-sets",
+                   "--hosted-zone-id", zoneid, "--change-batch",
+                   "file://%s" % changeset])
+
+    def _generate_upsert_dns(self):
+        ip = self._waitfor(self._get_external_ip, tries=30)
+        return [
+            {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                    "Name": self.params["hostname"],
+                    "Type": "A",
+                    "TTL": 60,
+                    "ResourceRecords": [
+                        {
+                            "Value": ip
+                        }
+                    ]
+                }
+            }
+        ]
+
+    def _generate_delete_dns(self, ip):
+        return [
+            {
+                "Action": "DELETE",
+                "ResourceRecordSet": {
+                    "Name": self.params["hostname"],
+                    "Type": "A",
+                }
+            }
+        ]
+
+    def _get_aws_zone_id(self):
+        hostname = self.params["hostname"]
+        domain = '.'.join(hostname.split('.')[1:])
+        try:
+            zp = self._run(["aws", "route53", "list-hosted-zones"],
+                           capture=True)
+            zones = json.loads(zp.stdout.decode('utf-8'))
+            zlist = zones["HostedZones"]
+            for z in zlist:
+                if z["Name"] == domain + ".":
+                    zonename = z["Id"]
+                    zone_components = zonename.split('/')
+                    zoneid = zone_components[-1]
+                    return zoneid
+            raise RuntimeError("No zone found")
+        except Exception as e:
+            raise RuntimeError(
+                "Could not determine AWS zone id for %s: %s" % (domain,
+                                                                str(e)))
+
+    def _destroy_dns_record(self):
+        logging.info("Destroying DNS record")
+        try:
+            self._change_dns_record("delete")
+        except Exception:
+            logging.warn("Failed to destroy DNS record")
+
     def _destroy_resources(self):
         with self.kubecontext():
             self._switch_to_context(self.params["kubernetes_cluster_name"])
-            self._destroy_logging_components()
+            self._destroy_dns_record()
+            self._destroy_nginx()
+            self._destroy_jupyterhub()
+            self._destroy_prepuller()
+            self._destroy_fs_keepalive()
             self._destroy_fileserver()
+            self._destroy_logging_components()
             self._destroy_gke_cluster()
 
     def _run_gcloud(self, args):
@@ -486,18 +664,26 @@ class JupyterLabDeployment(object):
         self.directory = None
 
     def deploy(self):
+        """Deploy JupyterLab Demo cluster.
+        """
         if not self.yamlfile:
             raise ValueError("Deployment requires input YAML file!")
         self._set_params()
         self._validate_deployment_params()
         self._normalize_params()
         self._create_from_template()
+        hn = self.params['hostname']
+        logging.info("Deployment of %s complete." % hn)
 
     def undeploy(self):
+        """Remove JupyterLab Demo cluster.
+        """
         self._set_params()
         self.directory = os.getenv("TMPDIR") or "/tmp"
         self._get_cluster_info()
         self._destroy_resources()
+        hn = self.params['hostname']
+        logging.info("Removal of %s complete." % hn)
 
 
 def get_cli_options():
