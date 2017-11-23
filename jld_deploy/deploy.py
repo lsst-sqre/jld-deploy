@@ -241,17 +241,20 @@ class JupyterLabDeployment(object):
         """Cache and return base64 representation of parameter value,
         suitable for kubernetes secrets."""
         if _empty(self.b64_cache, key):
-            self.b64_cache[key] = base64.b64encode(
-                self.params[key].encode('utf-8'))
-        return self.b64_cache[key].decode('utf-8')
+            val = self.params[key]
+            if type(val) is str:
+                val = val.encode('utf-8')
+            self.b64_cache[key] = base64.b64encode(val).decode('utf-8')
+        return self.b64_cache[key]
 
-    def encode_file(self, path):
-        """Cache and return base64 representation of file contents, suitable
-        for kubernetes secrets."""
+    def encode_file(self, key):
+        """Cache and return base64 representation of file contents at 
+        path specified in 'key', suitable for kubernetes secrets."""
+        path = self.params[key]
         cp = path + "_contents"
         if _empty(self.b64_cache, cp):
             try:
-                with open(path, "rb") as f:
+                with open(path, "r") as f:
                     c = f.read()
                     self.params[path] = c
                     b64_c = self.encode_value(path)
@@ -429,12 +432,13 @@ class JupyterLabDeployment(object):
 
     def _destroy_fileserver(self):
         logging.info("Destroying fileserver.")
+        # Not sure about this.  Andres doesn't delete the pv.
         ns = self.params["kubernetes_cluster_namespace"]
         for c in [["pvc", "jld-fileserver-home"],
                   ["pv", "jld-fileserver-home-%s" % ns],
-                  ["deployment", "jld-fileserver"],
                   ["service", "jld-fileserver"],
                   ["pvc", "jld-fileserver-physpvc"],
+                  ["deployment", "jld-fileserver"],
                   ["storageclass", "fast"]]:
             self._run_kubectl_delete(c)
 
