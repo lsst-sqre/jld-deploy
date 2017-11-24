@@ -1,6 +1,33 @@
 #!/usr/bin/env python3
+"""This is a wrapper around a JupyterLabDeployment class.  The class,
+at the moment, assumes the following:
+
+1) Deployment is to Google Kubernetes Engine.  You have chosen a cluster name
+    and optionally a namespace.
+2) Your DNS zone for your external endpoint is hosted in Route 53 and you
+    have chosen a FQDN for your application.
+3) You are running this from an execution context where gcloud, kubectl,
+    and aws have all been set up to run authenticated from the command
+    line.
+4) At least your external endpoint TLS certs are already generated and
+    exist on the local filesystem.  If you need certificates for ELK
+    stack communication, those must also be present on the local filesystem.
+5) You are using GitHub OAuth for your authentication, and you have
+    created an OAuth application Client ID, Client Secret, and a client
+    callback that is 'https://fqdn.of.jupyterlab.demo/hub/oauth_callback'
+6) All of this information has been encoded in a YAML file that you reference
+    with the -f switch during deployment.
+
+Obvious future enhancements are to make this work with a wider variety of
+Kubernetes and DNS providers.
+
+It is capable of deploying and undeploying a JupyterLab Demo environment,
+or of generating a set of Kubernetes configuration files suitable for
+editing and then deploying from this tool.
+"""
 import argparse
 import base64
+import dns.resolver
 import fnmatch
 import json
 import logging
@@ -18,6 +45,9 @@ from jinja2 import Template
 JUPYTERLAB_REPO_URL = "https://github.com/lsst-sqre/jupyterlabdemo.git"
 EXECUTABLES = ["gcloud", "kubectl", "aws"]
 DEFAULT_ZONE = "us-central1-a"
+DEFAULT_MACHINE_TYPE = "n1-standard-2"
+DEFAULT_NODE_COUNT = 2
+DEFAULT_VOLUME_SIZE_GB = 20
 
 
 class JupyterLabDeployment(object):
@@ -36,15 +66,18 @@ class JupyterLabDeployment(object):
     b64_cache = {}
     executables = {}
 
-    def __init__(self, yamlfile=None, params=None, disable_prepuller=False,
-                 existing_cluster=False):
+    def __init__(self, yamlfile=None, params=None, directory=None,
+                 disable_prepuller=False, existing_cluster=False,
+                 existing_namespace=False, config_only=False):
         self._check_executables(EXECUTABLES)
         self.yamlfile = yamlfile
         self.existing_cluster = existing_cluster
+        self.existing_namespace = existing_namespace
+        self.directory = directory
+        self.config_only = config_only
+        self.params = params
         if disable_prepuller:
             self.enable_prepuller = False
-        if params:
-            self.params = params
 
     @contextmanager
     def kubecontext(self):
@@ -62,23 +95,46 @@ class JupyterLabDeployment(object):
             self._run(restorec, check=False)
 
     def _check_authentication(self):
+        """We also set the AWS zone id from this: if the hostname is not
+        in an AWS hosted zone, we want to fail sooner rather than later.
+        """
         logging.info("Checking authentication.")
         gc = "gcloud container clusters get-credentials"
-        checkcmd = {"gke": {"cmd": ["gcloud", "compute", "instances", "list"],
-                            "config": "gke init"},
-                    "aws": {"cmd": ["aws", "ec2", "describe-instances"],
-                            "config": "aws configure"},
+        checkcmd = {"gke": {"cmd": ["gcloud", "container", "clusters",
+                                    "list"],
+                            "config": "gcloud init"},
                     "kubectl": {"cmd": ["kubectl", "get", "namespaces"],
                                 "config": gc}
                     }
         for c in checkcmd:
             cmd = checkcmd[c]["cmd"]
             cfg = checkcmd[c]["config"]
-            rc = self._run(cmd, capture=True, check=False)
-        if rc.returncode:
-            errstr = "%s not correctly configured; try `%s`" % (
-                c, cfg)
-            raise RuntimeError(errstr)
+            rc = self._run(cmd, capture=True, capture_stderr=True, check=False)
+            if rc.returncode != 0:
+                errstr = "%s not correctly configured; try `%s`" % (
+                    c, cfg)
+                raise RuntimeError(errstr)
+        self.params["zoneid"] = self._get_aws_zone_id()
+
+    def _get_aws_zone_id(self):
+        hostname = self.params["hostname"]
+        domain = '.'.join(hostname.split('.')[1:])
+        try:
+            zp = self._run(["aws", "route53", "list-hosted-zones"],
+                           capture=True)
+            zones = json.loads(zp.stdout.decode('utf-8'))
+            zlist = zones["HostedZones"]
+            for z in zlist:
+                if z["Name"] == domain + ".":
+                    zonename = z["Id"]
+                    zone_components = zonename.split('/')
+                    zoneid = zone_components[-1]
+                    return zoneid
+            raise RuntimeError("No zone found")
+        except Exception as e:
+            raise RuntimeError(
+                "Could not determine AWS zone id for %s: %s" % (domain,
+                                                                str(e)))
 
     def _check_executables(self, proglist):
         for p in proglist:
@@ -103,22 +159,25 @@ class JupyterLabDeployment(object):
                 return True
         return False
 
-    def _run(self, args, directory=None, capture=False, check=True):
+    def _run(self, args, directory=None, capture=False,
+             capture_stderr=False, check=True):
         stdout = None
+        stderr = None
         if capture:
             stdout = subprocess.PIPE
+        if capture_stderr:
+            stderr = subprocess.PIPE
         if not directory:
             directory = self.directory
-        cwd = os.getcwd()
-        os.chdir(directory)
-        exe = args[0]
-        fqexe = self.executables.get(exe)
-        if fqexe:
-            args[0] = fqexe
-        self._logcmd(args)
-        rc = subprocess.run(args, check=check, stdout=stdout)
-        os.chdir(cwd)
-        return rc
+        with _wd(directory):
+            exe = args[0]
+            fqexe = self.executables.get(exe)
+            if fqexe:
+                args[0] = fqexe
+            self._logcmd(args)
+            rc = subprocess.run(args, check=check, stdout=stdout,
+                                stderr=stderr)
+            return rc
 
     def _get_cluster_info(self):
         if self._empty_param('kubernetes_cluster_name'):
@@ -133,13 +192,19 @@ class JupyterLabDeployment(object):
         req_params = ["hostname", "github_client_id",
                       "github_client_secret",
                       "github_organization_whitelist",
-                      "volume_size_gigabytes",
                       "tls_cert", "tls_key", "tls_root_chain"]
         if self._any_empty(req_params):
             raise ValueError("All parameters '%s' must be specified!" %
                              str(req_params))
+        if self._empty_param('volume_size_gigabytes'):
+            logging.warn("Using default volume size: 20GiB")
+            self.params["volume_size_gigabytes"] = DEFAULT_VOLUME_SIZE_GB
         if self.params["volume_size_gigabytes"] < 1:
             raise ValueError("Shared volume must be at least 1 GiB!")
+        if self._empty_param('machine_type'):
+            self.params['machine_type'] = DEFAULT_MACHINE_TYPE
+        if self._empty_param('node_count'):
+            self.params['node_count'] = DEFAULT_NODE_COUNT
         return
 
     def _normalize_params(self):
@@ -199,19 +264,19 @@ class JupyterLabDeployment(object):
         shutil.rmtree(os.path.join(d, repo))
 
     def _substitute_templates(self):
-        os.chdir(os.path.join(self.directory, "deployment"))
-        self._generate_dhparams()
-        self._generate_crypto_key()
-        matches = {}
-        for c in self.components:
-            matches[c] = []
-            for root, dirnames, filenames in os.walk(c):
-                for filename in fnmatch.filter(filenames, '*.template.yml'):
-                    matches[c].append(os.path.join(root, filename))
-        for c in self.components:
-            templates = matches[c]
-            for t in templates:
-                self._substitute_file(t)
+        with _wd(os.path.join(self.directory, "deployment")):
+            self._generate_dhparams()
+            self._generate_crypto_key()
+            matches = {}
+            for c in self.components:
+                matches[c] = []
+                for root, dirnames, filenames in os.walk(c):
+                    for fn in fnmatch.filter(filenames, '*.template.yml'):
+                        matches[c].append(os.path.join(root, fn))
+            for c in self.components:
+                templates = matches[c]
+                for t in templates:
+                    self._substitute_file(t)
 
     def _generate_crypto_key(self):
         ck = os.urandom(16).hex() + ";" + os.urandom(16).hex()
@@ -224,14 +289,12 @@ class JupyterLabDeployment(object):
     def _generate_dhparams(self):
         if self._empty_param('tls_dhparam'):
             bits = self.params['dhparam_bits']
-            cwd = os.getcwd()
-            os.chdir(self.directory)
-            ossl = self.executables["openssl"]
-            cmd = [ossl, "dhparam", str(bits)]
-            rc = self._run(cmd, capture=True)
-            dhp = rc.stdout.decode('utf-8')
-            self.params["dhparams"] = dhp
-            os.chdir(cwd)
+            with _wd(self.directory):
+                ossl = self.executables["openssl"]
+                cmd = [ossl, "dhparam", str(bits)]
+                rc = self._run(cmd, capture=True)
+                dhp = rc.stdout.decode('utf-8')
+                self.params["dhparams"] = dhp
         else:
             with open(self.params['tls_dhparam'], "r") as f:
                 dhp = f.read()
@@ -248,7 +311,7 @@ class JupyterLabDeployment(object):
         return self.b64_cache[key]
 
     def encode_file(self, key):
-        """Cache and return base64 representation of file contents at 
+        """Cache and return base64 representation of file contents at
         path specified in 'key', suitable for kubernetes secrets."""
         path = self.params[key]
         cp = path + "_contents"
@@ -339,6 +402,36 @@ class JupyterLabDeployment(object):
             self._create_nginx()
             self._create_dns_record()
 
+    def _create_gke_cluster(self):
+        mtype = self.params['machine_type']
+        nodes = self.params['node_count']
+        name = self.params['kubernetes_cluster_name']
+        namespace = self.params['kubernetes_cluster_namespace']
+        if not self.existing_cluster:
+            self._run_gcloud(["container", "clusters", "create", name,
+                              "--num-nodes=%d" % nodes,
+                              "--machine-type=%s" % mtype
+                              ])
+            self._run_gcloud(["container", "clusters", "get-credentials",
+                              name])
+        self._switch_to_context(name)
+        if namespace != "default" and not self.existing_namespace:
+            self._run(["kubectl", "create", "namespace", namespace])
+
+    def _destroy_gke_cluster(self):
+        name = self.params['kubernetes_cluster_name']
+        namespace = self.params['kubernetes_cluster_namespace']
+        if namespace != "default" and not self.existing_namespace:
+            rc = self._run(
+                ["kubectl", "config", "current-context"], capture=True)
+            if rc.stdout:
+                context = rc.stdout.decode('utf-8').strip()
+                self._run(["kubectl", "config", "set-context", context,
+                           "--namespace", "default"])
+            self._run(["kubectl", "delete", "namespace", namespace])
+        if not self.existing_cluster:
+            self._run_gcloud(["-q", "container", "clusters", "delete", name])
+
     def _create_logging_components(self):
         logging.info("Creating logging components.")
         for c in [os.path.join("logstashrmq", "logstashrmq-secrets.yml"),
@@ -407,9 +500,8 @@ class JupyterLabDeployment(object):
                        capture=True)
         if rc.stdout:
             struct = yaml.load(rc.stdout.decode('utf-8'))
-            if "spec" in struct and "clusterIP" in struct["spec"]:
-                if struct["spec"]["clusterIP"]:
-                    return struct["spec"]["clusterIP"]
+            if not _empty(struct, "spec"):
+                return struct["spec"]["clusterIP"]
         return None
 
     def _get_external_ip(self):
@@ -421,18 +513,28 @@ class JupyterLabDeployment(object):
                        capture=True)
         if rc.stdout:
             struct = yaml.load(rc.stdout.decode('utf-8'))
-            if "status" in struct and struct["status"]:
+            if not _empty(struct, "status"):
                 st = struct["status"]
-                if "loadBalancer" in st and st["loadBalancer"]:
+                if not _empty(st, "loadBalancer"):
                     lb = st["loadBalancer"]
-                    if "ingress" in lb and lb["ingress"]:
+                    if not _empty(lb, "ingress"):
                         ng = lb["ingress"]
                         return ng[0]["ip"]
         return None
 
+    def _get_pods_for_name(self, depname):
+        logging.info("Getting pod names for '%s'." % depname)
+        retval = []
+        rc = self._run(["kubectl", "get", "pods", "-o", "yaml"], capture=True)
+        struct = yaml.load(rc.stdout.decode('utf-8'))
+        for pod in struct["items"]:
+            name = pod["metadata"]["name"]
+            if name.startswith(depname):
+                retval.append(name)
+        return retval
+
     def _destroy_fileserver(self):
         logging.info("Destroying fileserver.")
-        # Not sure about this.  Andres doesn't delete the pv.
         ns = self.params["kubernetes_cluster_namespace"]
         for c in [["pvc", "jld-fileserver-home"],
                   ["pv", "jld-fileserver-home-%s" % ns],
@@ -441,6 +543,9 @@ class JupyterLabDeployment(object):
                   ["deployment", "jld-fileserver"],
                   ["storageclass", "fast"]]:
             self._run_kubectl_delete(c)
+        logging.info("Waiting for fileserver pods to exit.")
+        self._waitfor(callback=self._check_fileserver_gone, tries=30)
+        logging.info("All fileserver pods exited.")
 
     def _create_fs_keepalive(self):
         logging.info("Creating fs-keepalive")
@@ -454,6 +559,21 @@ class JupyterLabDeployment(object):
     def _destroy_fs_keepalive(self):
         logging.info("Destroying fs-keepalive")
         self._run_kubectl_delete(["deployment", "jld-keepalive"])
+        logging.info("Waiting for keepalive pods to exit.")
+        self._waitfor(callback=self._check_keepalive_gone, tries=30)
+        logging.info("All keepalive pods exited.")
+
+    def _check_keepalive_gone(self):
+        return self._check_pods_gone("jld-keepalive")
+
+    def _check_fileserver_gone(self):
+        return self._check_pods_gone("jld-fileserver")
+
+    def _check_pods_gone(self, name):
+        pods = self._get_pods_for_name(name)
+        if pods:
+            return None
+        return True
 
     def _create_prepuller(self):
         logging.info("Creating prepuller")
@@ -511,7 +631,7 @@ class JupyterLabDeployment(object):
         self._change_dns_record("create")
 
     def _change_dns_record(self, action):
-        zoneid = self._get_aws_zone_id()
+        zoneid = self.params["zoneid"]
         record = {
             "Comment": "JupyterLab Demo %s/%s" % (
                 self.params['kubernetes_cluster_name'],
@@ -533,7 +653,7 @@ class JupyterLabDeployment(object):
                    "file://%s" % changeset])
 
     def _generate_upsert_dns(self):
-        ip = self._waitfor(self._get_external_ip, tries=30)
+        ip = self._waitfor(callback=self._get_external_ip, tries=30)
         return [
             {
                 "Action": "UPSERT",
@@ -550,43 +670,34 @@ class JupyterLabDeployment(object):
             }
         ]
 
-    def _generate_delete_dns(self, ip):
+    def _generate_delete_dns(self):
+        host = self.params["hostname"]
+        answer = dns.resolver.query(host, 'A')
+        response = answer.rrset.to_text().split()
+        ttl = int(response[1])
+        ip = response[4]
         return [
             {
                 "Action": "DELETE",
                 "ResourceRecordSet": {
-                    "Name": self.params["hostname"],
+                    "Name": host + ".",
                     "Type": "A",
+                    "TTL": ttl,
+                    "ResourceRecords": [
+                        {
+                            "Value": ip
+                        }
+                    ]
                 }
             }
         ]
-
-    def _get_aws_zone_id(self):
-        hostname = self.params["hostname"]
-        domain = '.'.join(hostname.split('.')[1:])
-        try:
-            zp = self._run(["aws", "route53", "list-hosted-zones"],
-                           capture=True)
-            zones = json.loads(zp.stdout.decode('utf-8'))
-            zlist = zones["HostedZones"]
-            for z in zlist:
-                if z["Name"] == domain + ".":
-                    zonename = z["Id"]
-                    zone_components = zonename.split('/')
-                    zoneid = zone_components[-1]
-                    return zoneid
-            raise RuntimeError("No zone found")
-        except Exception as e:
-            raise RuntimeError(
-                "Could not determine AWS zone id for %s: %s" % (domain,
-                                                                str(e)))
 
     def _destroy_dns_record(self):
         logging.info("Destroying DNS record")
         try:
             self._change_dns_record("delete")
-        except Exception:
-            logging.warn("Failed to destroy DNS record")
+        except Exception as e:
+            logging.warn("Failed to destroy DNS record: %s" % str(e))
 
     def _destroy_resources(self):
         with self.kubecontext():
@@ -614,22 +725,6 @@ class JupyterLabDeployment(object):
                       self.params["kubernetes_cluster_namespace"])],
                   check=False)
 
-    def _create_gke_cluster(self):
-        mtype = "n1-standard-2"
-        nodes = 2
-        name = self.params['kubernetes_cluster_name']
-        namespace = self.params['kubernetes_cluster_namespace']
-        if not self.existing_cluster:
-            self._run_gcloud(["container", "clusters", "create", name,
-                              "--num-nodes=%d" % nodes,
-                              "--machine-type=%s" % mtype
-                              ])
-            self._run_gcloud(["container", "clusters", "get-credentials",
-                              name])
-        self._switch_to_context(name)
-        if namespace != "default":
-            self._run(["kubectl", "create", "namespace", namespace])
-
     def _switch_to_context(self, name):
         context = None
         rc = self._run(["kubectl", "config", "get-contexts"], capture=True)
@@ -650,30 +745,32 @@ class JupyterLabDeployment(object):
         self._run(["kubectl", "config", "set-context", context,
                    "--namespace", self.params['kubernetes_cluster_namespace']])
 
-    def _destroy_gke_cluster(self):
-        name = self.params['kubernetes_cluster_name']
-        namespace = self.params['kubernetes_cluster_namespace']
-        if namespace != "default":
-            rc = self._run(
-                ["kubectl", "config", "current-context"], capture=True)
-            if rc.stdout:
-                context = rc.stdout.decode('utf-8').strip()
-                self._run(["kubectl", "config", "set-context", context,
-                           "--namespace", "default"])
-            self._run(["kubectl", "delete", "namespace", namespace])
-        if not self.existing_cluster:
-            self._run_gcloud(["-q", "container", "clusters", "delete", name])
+    def _create_deployment(self):
+        d = self.directory
+        if d:
+            if not os.path.isdir(d):
+                os.makedirs(d)
+                self.directory = d
+            if not os.path.isdir(os.path.join(d, "deployment")):
+                self._generate_config()
+            if not self.config_only:
+                self._create_resources()
+                return
+        else:
+            with tempfile.TemporaryDirectory() as d:
+                self.directory = d
+                self._generate_config()
+                self._create_resources()
+            self.directory = None
+        hn = self.params['hostname']
+        logging.info("Deployment of %s complete." % hn)
 
-    def _create_from_template(self):
-        with tempfile.TemporaryDirectory() as d:
-            logging.info("Working dir: %s" % d)
-            self.directory = d
+    def _generate_config(self):
+        with _wd(self.directory):
             self._get_repo()
             self._copy_deployment_files()
             self._substitute_templates()
             self._rename_fileserver_template()
-            self._create_resources()
-        self.directory = None
 
     def deploy(self):
         """Deploy JupyterLab Demo cluster.
@@ -683,9 +780,8 @@ class JupyterLabDeployment(object):
         self._set_params()
         self._validate_deployment_params()
         self._normalize_params()
-        self._create_from_template()
-        hn = self.params['hostname']
-        logging.info("Deployment of %s complete." % hn)
+        self._create_deployment()
+        logging.info("Finished.")
 
     def undeploy(self):
         """Remove JupyterLab Demo cluster.
@@ -702,8 +798,19 @@ def get_cli_options():
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(description="Specify JupyterLab Demo" +
                                      " parameters.")
+    parser.add_argument("-c", "--create-config", "--create-configuration",
+                        help=("Create configuration only.  Do not deploy." +
+                              "  Requires --directory."), action='store_true')
+    parser.add_argument("-d", "--directory",
+                        help=("Use specified directory and leave " +
+                              "configuration files in place.  If " +
+                              "directory already contains configuration " +
+                              "files, use them instead of cloning " +
+                              "repository and resubstituting."),
+                        default=None)
     parser.add_argument("-f", "--file", "--input-file",
-                        help="YAML file specifying demo parameters",
+                        help=("YAML file specifying demo parameters.  " +
+                              "Required for undeployment as well."),
                         default=None)
     parser.add_argument("-u", "--undeploy",
                         help="Undeploy JupyterLab Demo cluster",
@@ -712,9 +819,25 @@ def get_cli_options():
                         help="Do not deploy prepuller",
                         action='store_true')
     parser.add_argument(
-        "--existing-cluster", help="Do not create/destroy cluster",
+        "--existing-cluster", help=("Do not create/destroy cluster.  " +
+                                    "Respected for undeployment as well."),
+        action='store_true')
+    parser.add_argument(
+        "--existing-namespace", help=("Do not create/destroy namespace.  " +
+                                      "Respected for undeployment as well." +
+                                      "  Requires --existing-cluster."),
         action='store_true')
     return parser.parse_args()
+
+
+@contextmanager
+def _wd(newdir):
+    """Save and restore working directory.
+    """
+    cwd = os.getcwd()
+    os.chdir(newdir)
+    yield
+    os.chdir(cwd)
 
 
 def _empty(input_dict, k):
@@ -746,9 +869,15 @@ def standalone_deploy(options):
     d_p = options.disable_prepuller
     y_f = options.file
     e_c = options.existing_cluster
+    e_n = options.existing_namespace
+    e_d = options.directory
+    c_c = options.create_config
     deployment = JupyterLabDeployment(yamlfile=y_f,
                                       disable_prepuller=d_p,
                                       existing_cluster=e_c,
+                                      existing_namespace=e_n,
+                                      directory=e_d,
+                                      config_only=c_c
                                       )
     deployment.deploy()
 
@@ -758,13 +887,15 @@ def standalone_undeploy(options):
     """
     y_f = options.file
     e_c = options.existing_cluster
+    e_n = options.existing_namespace
     deployment = JupyterLabDeployment(yamlfile=y_f,
                                       existing_cluster=e_c,
+                                      existing_namespace=e_n,
                                       )
     deployment.undeploy()
 
 
-if __name__ == "__main__":
+def standalone():
     logging.basicConfig(format='%(asctime)s %(message)s',
                         datefmt='%m/%d/%Y %I:%M:%S %p',
                         level=logging.DEBUG)
@@ -773,3 +904,7 @@ if __name__ == "__main__":
         standalone_undeploy(options)
     else:
         standalone_deploy(options)
+
+
+if __name__ == "__main__":
+    standalone()
