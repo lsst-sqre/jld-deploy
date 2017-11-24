@@ -20,7 +20,7 @@ tls_key:  '/path/to/key.pem'
 tls_root_chain: '/path/to/chain.pem'
 # If tls_dhparam is not set, it will be generated on the fly.
 #  This can be very slow.
-tls_dhparam: '/path/to/dhparam.pem'
+# tls_dhparam: '/path/to/dhparam.pem'
 # dhparam_bits defaults to 2048; it is only used if tls_dhparam is
 # unset.
 # dhparam_bits: 2048

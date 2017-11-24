@@ -1,2 +1,2 @@
 #!/usr/bin/env python3
-from .deploy import JupyterLabDeployment
+from .deploy import JupyterLabDeployment, standalone
