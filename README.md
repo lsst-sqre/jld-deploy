@@ -36,24 +36,38 @@ organizations, the following should get you going.
    deployment.  Put the following files (in PEM format) in a directory
    on the machine you are running the deployment from:
    
-    - TLS Certificate
-	- TLS Key
-	- TLS Root Chain
+    - TLS Certificate (cert.pem)
+	- TLS Key (key.pem)
+	- TLS Root Chain (chain.pem)
 	   
 4. Make sure that your shell environment is set up to allow `gcloud`,
    `kubectl`, and `aws` to run authenticated.  This will require `gcloud
    init`, `aws configure`, and an installation of the `kubectl`
    component of `gcloud`.
 
-5. Create a Python virtualenv with Python3 as its interpreter.  I like
-   to use `virtualenv-wrapper` and `mkvirtualenv`; if you're doing that,
-   `mkvirtualenv -p $(which python3)`.  Activate that virtualenv.
+5. Create a Python virtualenv with Python3 as its interpreter.  This
+   step is not strictly necessary but will keep you from cluttering up
+   your system python with the modules required for deployment.
+   
+   Python 3 is necessary: this deployment will not work with Python 2.
+
+    - I like to use `virtualenv-wrapper` and `mkvirtualenv`; if you're
+   doing that, `mkvirtualenv -p $(which python3)` (you will need to have
+   started a shell with the `mkvirtualenv` alias available first).
+   
+   - Without `virtualenv-wrapper` you would do something like `python3
+   -m venv /path/to/environment` followed by `source
+   /path/to/environment/bin/activate`.
+
+    - Without a virtual environment you will need to use the `--user`
+    option on the `pip3` command below.
 
 6. Change to a working directory you like and clone this repository
    (`git clone https://github.com/lsst-sqre/jld-deploy`).
    
 7. `cd jld-deploy`.  Then (making sure you are inside the activated
-   virtualenv) `pip install -e .`.
+   virtualenv) `pip3 install -e .`.  If you chose to not use virtualenv,
+   `pip3 install --user -e .`.
    
 8. `cp deploy.yml mydeploy.yml`.  Edit `mydeploy.yml`.  The following
    settings are required:
