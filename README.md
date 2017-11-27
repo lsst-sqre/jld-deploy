@@ -36,16 +36,16 @@ organizations, the following should get you going.
    deployment.  Put the following files (in PEM format) in a directory
    on the machine you are running the deployment from:
    
-    - TLS Certificate
-	- TLS Key
-	- TLS Root Chain
+    - TLS Certificate (cert.pem)
+	- TLS Key (key.pem)
+	- TLS Root Chain (chain.pem)
 	   
 4. Make sure that your shell environment is set up to allow `gcloud`,
    `kubectl`, and `aws` to run authenticated.  This will require `gcloud
    init`, `aws configure`, and an installation of the `kubectl`
    component of `gcloud`.
 
-5. Create a Python virtualenv with Python3 as its interpreter.  I like
+5. NOT REALLY NECESSARY. Create a Python virtualenv with Python3 as its interpreter.  I like
    to use `virtualenv-wrapper` and `mkvirtualenv`; if you're doing that,
    `mkvirtualenv -p $(which python3)`.  Activate that virtualenv.
 
@@ -53,7 +53,7 @@ organizations, the following should get you going.
    (`git clone https://github.com/lsst-sqre/jld-deploy`).
    
 7. `cd jld-deploy`.  Then (making sure you are inside the activated
-   virtualenv) `pip install -e .`.
+   virtualenv) `pip3 install -e .`.
    
 8. `cp deploy.yml mydeploy.yml`.  Edit `mydeploy.yml`.  The following
    settings are required:
@@ -63,7 +63,7 @@ organizations, the following should get you going.
       the TLS PEM files you got earlier: specify the (local) path to
       them.
 	- `github_client_id` and `github_client_secret` from the OAuth
-      application you created earlier.
+      application you created earlier. These hsould be base64 encoded e.g. echo -n $ITEM | base64 -i -
 	- `github_organization_whitelist`: each list entry is a GitHub
       organization name that, if the person logging in is a member of,
       login will be allowed to succeed.
