@@ -919,8 +919,8 @@ def get_cli_options():
                               "present, used instead of environment or " +
                               "prompt."),
                         default=None)
-    parser.add_argument("-u", "--undeploy",
-                        help="Undeploy JupyterLab Demo cluster",
+    parser.add_argument("-u", "--undeploy", "--destroy", "--remove",
+                        help="Undeploy JupyterLab Demo cluster.",
                         action='store_true')
     parser.add_argument("--disable-prepuller", "--no-prepuller",
                         help="Do not deploy prepuller",
