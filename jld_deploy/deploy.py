@@ -888,8 +888,8 @@ def get_cli_options():
     """Parse command-line arguments"""
     desc = "Deploy or destroy the JupyterLab Demo environment. "
     desc += ("Parameters required in order to be able to destroy the " +
-             "JupyterLab Demo are: %s." % REQUIRED_PARAMETER_NAMES +
-             ". In order to deploy the cluster, the " +
+             "JupyterLab Demo are: %s. " % REQUIRED_PARAMETER_NAMES +
+             "In order to deploy the cluster, the " +
              "required set is: %s. " % REQUIRED_DEPLOYMENT_PARAMETER_NAMES +
              "These may be set in the YAML file specified with the " +
              "'--file' argument, or passed in in the environment (for each " +
