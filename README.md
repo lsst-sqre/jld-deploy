@@ -81,12 +81,21 @@ organizations, the following should get you going.
 	- `github_organization_whitelist`: each list entry is a GitHub
       organization name that, if the person logging in is a member of,
       login will be allowed to succeed.
+	  
+   You can also specify these as environment variables.  The rule for
+   creation is that the environment variable name is `JLD_` prepended to
+   the uppercase representation of the setting name, so you'd need, for
+   instance, `JLD_KUBERNETES_CLUSTER_NAME`.  If you run the deployment
+   program without either specifying a file or supplying required
+   parameters in the environment, you will be prompted for those parameters.
 
    Feel free to customize other settings.  You particularly may want to
    change the volume size, and I strongly recommend precreating your
    `dhparam.pem` file with `openssl dhparam 2048 > dhparam.pem` in the
    same directory as the rest of your TLS files, and then enabling it in
-   the deployment YAML.
+   the deployment YAML.  All deployment settings can also be represented
+   in the environment, but optional settings will not be
+   prompted--instead, defaults will be used.
    
 9. Run `deploy-jupyterlabdemo -f /path/to/mydeploy.yml` .
 

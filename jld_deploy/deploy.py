@@ -15,8 +15,18 @@ at the moment, assumes the following:
 5) You are using GitHub OAuth for your authentication, and you have
     created an OAuth application Client ID, Client Secret, and a client
     callback that is 'https://fqdn.of.jupyterlab.demo/hub/oauth_callback'
-6) All of this information has been encoded in a YAML file that you reference
-    with the -f switch during deployment.
+6) Either all of this information has been encoded in a YAML file that you
+    reference with the -f switch during deployment, or it's in a series of
+    environment variables starting with "JLD_", or you enter it at a
+    terminal prompt.
+    - If you specify a directory for TLS certificates, the
+      certificate, key, and root chain files must be named "cert.pem",
+      "key.pem", and "chain.pem" respectively.  If you already have a
+      DH Params file, it should be called "dhparam.pem" in the same directory.
+    - If present in that directory, the ELK certificates must be
+      "beats_cert.pem", "beats_key.pem", and
+      "beats_ca.pem" for certificate, key, and certificate authority
+      respectively.
 
 Obvious future enhancements are to make this work with a wider variety of
 Kubernetes and DNS providers.
@@ -27,6 +37,7 @@ editing and then deploying from this tool.
 """
 import argparse
 import base64
+import datetime
 import dns.resolver
 import fnmatch
 import json
@@ -41,13 +52,35 @@ import yaml
 from contextlib import contextmanager
 from jinja2 import Template
 
-
 JUPYTERLAB_REPO_URL = "https://github.com/lsst-sqre/jupyterlabdemo.git"
 EXECUTABLES = ["gcloud", "kubectl", "aws"]
-DEFAULT_ZONE = "us-central1-a"
-DEFAULT_MACHINE_TYPE = "n1-standard-2"
-DEFAULT_NODE_COUNT = 2
+DEFAULT_GKE_ZONE = "us-central1-a"
+DEFAULT_GKE_MACHINE_TYPE = "n1-standard-2"
+DEFAULT_GKE_NODE_COUNT = 2
 DEFAULT_VOLUME_SIZE_GB = 20
+ENVIRONMENT_NAMESPACE = "JLD_"
+REQUIRED_PARAMETER_NAMES = ["kubernetes_cluster_name",
+                            "hostname"]
+REQUIRED_DEPLOYMENT_PARAMETER_NAMES = REQUIRED_PARAMETER_NAMES + [
+    "github_client_id",
+    "github_client_secret",
+    "github_organization_whitelist",
+    "tls_cert",
+    "tls_key",
+    "tls_root_chain"
+]
+PARAMETER_NAMES = REQUIRED_DEPLOYMENT_PARAMETER_NAMES + [
+    "kubernetes_cluster_namespace",
+    "gke_zone",
+    "gke_node_count",
+    "gke_machine_type",
+    "volume_size_gigabytes",
+    "session_db_url",
+    "shipper_name",
+    "rabbitmq_pan_password",
+    "rabbitmq_target_host",
+    "rabbitmq_target_vhost",
+    "firefly_admin_password"]
 
 
 class JupyterLabDeployment(object):
@@ -147,6 +180,9 @@ class JupyterLabDeployment(object):
         if not self.params:
             with open(self.yamlfile, 'r') as f:
                 self.params = yaml.load(f)
+            for p in params:
+                if p not in PARAMETER_NAMES:
+                    logging.warn("Unknown parameter '%s'!" % p)
 
     def _empty_param(self, key):
         if key not in self.params or not self.params[key]:
@@ -184,27 +220,23 @@ class JupyterLabDeployment(object):
             raise ValueError("'kubernetes_cluster_name' must be set.")
         if self._empty_param('kubernetes_cluster_namespace'):
             self.params["kubernetes_cluster_namespace"] = 'default'
-        if self._empty_param('zone'):
-            self.params["zone"] = DEFAULT_ZONE
+        if self._empty_param('gke_zone'):
+            self.params["gke_zone"] = DEFAULT_GKE_ZONE
 
     def _validate_deployment_params(self):
         self._get_cluster_info()
-        req_params = ["hostname", "github_client_id",
-                      "github_client_secret",
-                      "github_organization_whitelist",
-                      "tls_cert", "tls_key", "tls_root_chain"]
-        if self._any_empty(req_params):
+        if self._any_empty(REQUIRED_PARAMETER_NAMES):
             raise ValueError("All parameters '%s' must be specified!" %
-                             str(req_params))
+                             str(REQUIRED_PARAMETER_NAMES))
         if self._empty_param('volume_size_gigabytes'):
             logging.warn("Using default volume size: 20GiB")
             self.params["volume_size_gigabytes"] = DEFAULT_VOLUME_SIZE_GB
         if self.params["volume_size_gigabytes"] < 1:
             raise ValueError("Shared volume must be at least 1 GiB!")
-        if self._empty_param('machine_type'):
-            self.params['machine_type'] = DEFAULT_MACHINE_TYPE
-        if self._empty_param('node_count'):
-            self.params['node_count'] = DEFAULT_NODE_COUNT
+        if self._empty_param('gke_machine_type'):
+            self.params['gke_machine_type'] = DEFAULT_GKE_MACHINE_TYPE
+        if self._empty_param('gke_node_count'):
+            self.params['gke_node_count'] = DEFAULT_GKE_NODE_COUNT
         return
 
     def _normalize_params(self):
@@ -215,7 +247,6 @@ class JupyterLabDeployment(object):
         else:
             nfs_sz = "950Mi"
         self.params['nfs_volume_size'] = nfs_sz
-        del(self.params['volume_size_gigabytes'])
         self.params['github_callback_url'] = \
             "https://%s/hub/oauth_callback" % self.params['hostname']
         self.params["github_organization_whitelist"] = ','.join(
@@ -232,7 +263,7 @@ class JupyterLabDeployment(object):
         logging_vars = ['rabbitmq_pan_password',
                         'rabbitmq_target_host',
                         'rabbitmq_target_vhost',
-                        'shipper_name',
+                        'log_shipper_name',
                         'beats_key',
                         'beats_ca',
                         'beats_cert']
@@ -245,7 +276,7 @@ class JupyterLabDeployment(object):
             self.params[
                 'session_db_url'] = 'sqlite:////home/jupyter/jupyterhub.sqlite'
         if self._empty_param('tls_dhparam'):
-            self._check_executable("openssl")
+            self._check_executables(["openssl"])
             if self._empty_param('dhparam_bits'):
                 self.params['dhparam_bits'] = 2048
 
@@ -371,7 +402,7 @@ class JupyterLabDeployment(object):
                           CA_CERTIFICATE=self.encode_file('beats_ca'),
                           BEATS_CERTIFICATE=self.encode_file('beats_cert'),
                           BEATS_KEY=self.encode_file('beats_key'),
-                          SHIPPER_NAME=p['shipper_name'],
+                          SHIPPER_NAME=p['log_shipper_name'],
                           RABBITMQ_PAN_PASSWORD=self.encode_value(
                               'rabbitmq_pan_password'),
                           RABBITMQ_TARGET_HOST=p['rabbitmq_target_host'],
@@ -389,6 +420,42 @@ class JupyterLabDeployment(object):
         tgt = os.path.join(directory, fnbase + ".template.yml")
         os.rename(src, tgt)
 
+    def _save_deployment_yml(self):
+        tfmt = '%Y-%m-%d-%H-%M-%S-%f-UTC'
+        datestr = datetime.datetime.utcnow().strftime(tfmt)
+        outf = os.path.join(self.directory, "deploy.%s.yml" % datestr)
+        # Use input file if we have it
+        if self.yamlfile:
+            shutil.copy2(self.yamlfile, outf)
+        else:
+            ymlstr = "# JupyterLab Demo deployment file\n"
+            ymlstr += "# Created at %s\n" % datestr
+            cleancopy = self._clean_param_copy()
+            ymlstr += yaml.dump(cleancopy, default_flow_style=False)
+            with open(outf, "w") as f:
+                f.write(ymlstr)
+
+    def _clean_param_copy(self):
+        cleancopy = {}
+        pathvars = ['tls_cert', 'tls_key', 'tls_root_chain',
+                    'beats_cert', 'beats_key', 'beats_ca']
+        fullpathvars = set()
+        for p in pathvars:
+            v = self.params.get(p)
+            if v:
+                fullpathvars.add(v)
+        for k, v in self.params.items():
+            if not v:
+                continue
+            if k == 'dhparams':
+                continue
+            if k == 'nfs_volume_size' or k == 'volume_size':
+                continue
+            if k in fullpathvars:
+                continue
+            cleancopy[k] = v
+        return cleancopy
+
     def _create_resources(self):
         with self.kubecontext():
             self._create_gke_cluster()
@@ -403,8 +470,8 @@ class JupyterLabDeployment(object):
             self._create_dns_record()
 
     def _create_gke_cluster(self):
-        mtype = self.params['machine_type']
-        nodes = self.params['node_count']
+        mtype = self.params['gke_machine_type']
+        nodes = self.params['gke_node_count']
         name = self.params['kubernetes_cluster_name']
         namespace = self.params['kubernetes_cluster_namespace']
         if not self.existing_cluster:
@@ -488,7 +555,7 @@ class JupyterLabDeployment(object):
             time.sleep(delay)
             if i == tries:
                 raise RuntimeError(
-                    "Did not receive IP after %d %ds iterations" %
+                    "Callback did not succeed after %d %ds iterations" %
                     (tries, delay))
 
     def _get_fileserver_ip(self):
@@ -543,9 +610,24 @@ class JupyterLabDeployment(object):
                   ["deployment", "jld-fileserver"],
                   ["storageclass", "fast"]]:
             self._run_kubectl_delete(c)
-        logging.info("Waiting for fileserver pods to exit.")
-        self._waitfor(callback=self._check_fileserver_gone, tries=30)
-        logging.info("All fileserver pods exited.")
+        self._destroy_pods_with_callback(self._check_fileserver_gone,
+                                         "fileserver")
+
+    def _destroy_pods_with_callback(self, callback, poddesc, tries=60):
+        logging.info("Waiting for %s pods to exit." % poddesc)
+        try:
+            self._waitfor(callback=callback, tries=tries)
+        except Exception:
+            if self.existing_cluster:
+                # If we aren't destroying the cluster, then failing to
+                #  take down the keepalive pod means we're going to fail.
+                # If we are, the cluster teardown means we don't actually
+                #  care a lot whether or not the individual deployment
+                #  destructions work.
+                raise
+            logging.warn("All %s pods did not exit.  Continuing." % poddesc)
+            return
+        logging.warn("All %s pods exited." % poddesc)
 
     def _create_fs_keepalive(self):
         logging.info("Creating fs-keepalive")
@@ -559,9 +641,8 @@ class JupyterLabDeployment(object):
     def _destroy_fs_keepalive(self):
         logging.info("Destroying fs-keepalive")
         self._run_kubectl_delete(["deployment", "jld-keepalive"])
-        logging.info("Waiting for keepalive pods to exit.")
-        self._waitfor(callback=self._check_keepalive_gone, tries=30)
-        logging.info("All keepalive pods exited.")
+        self._destroy_pods_with_callback(self._check_keepalive_gone,
+                                         "keepalive")
 
     def _check_keepalive_gone(self):
         return self._check_pods_gone("jld-keepalive")
@@ -712,7 +793,7 @@ class JupyterLabDeployment(object):
             self._destroy_gke_cluster()
 
     def _run_gcloud(self, args):
-        newargs = ["gcloud"] + args + ["--zone=%s" % self.params["zone"]]
+        newargs = ["gcloud"] + args + ["--zone=%s" % self.params["gke_zone"]]
         self._run(newargs)
 
     def _run_kubectl_create(self, filename):
@@ -763,7 +844,14 @@ class JupyterLabDeployment(object):
                 self._create_resources()
             self.directory = None
         hn = self.params['hostname']
-        logging.info("Deployment of %s complete." % hn)
+        if self.config_only:
+            cfgtext = "Configuration for %s generated" % hn
+            if self.directory:
+                cfgtext += " in %s" % self.directory
+            cfgtext += "."
+            logging.info(cfgtext)
+        else:
+            logging.info("Deployment of %s complete." % hn)
 
     def _generate_config(self):
         with _wd(self.directory):
@@ -771,12 +859,14 @@ class JupyterLabDeployment(object):
             self._copy_deployment_files()
             self._substitute_templates()
             self._rename_fileserver_template()
+            self._save_deployment_yml()
 
     def deploy(self):
         """Deploy JupyterLab Demo cluster.
         """
-        if not self.yamlfile:
-            raise ValueError("Deployment requires input YAML file!")
+        if not self.yamlfile and not self.params:
+            errstr = "YAML file or parameter set required."
+            raise ValueError(errstr)
         self._set_params()
         self._validate_deployment_params()
         self._normalize_params()
@@ -796,8 +886,23 @@ class JupyterLabDeployment(object):
 
 def get_cli_options():
     """Parse command-line arguments"""
-    parser = argparse.ArgumentParser(description="Specify JupyterLab Demo" +
-                                     " parameters.")
+    desc = "Deploy or destroy the JupyterLab Demo environment. "
+    desc += ("Parameters required in order to be able to destroy the " +
+             "JupyterLab Demo are: %s." % REQUIRED_PARAMETER_NAMES +
+             ". In order to deploy the cluster, the " +
+             "required set is: %s. " % REQUIRED_DEPLOYMENT_PARAMETER_NAMES +
+             "These may be set in the YAML file specified with the " +
+             "'--file' argument, or passed in in the environment (for each " +
+             "name, the corresponding environment variable is 'JLD_' " +
+             "prepended to the parameter name in uppercase). If no file " +
+             "is specified and a required value is still missing, the " +
+             "value will be prompted for on standard input. ")
+    desc += ("All deployment parameters may be set from the environment, " +
+             "not just required ones. The complete set of recognized " +
+             "parameters is: %s. " % PARAMETER_NAMES)
+    desc += ("Therefore the set of allowable environment variables is: " +
+             "%s." % ["JLD_" + x.upper() for x in PARAMETER_NAMES])
+    parser = argparse.ArgumentParser(description=desc)
     parser.add_argument("-c", "--create-config", "--create-configuration",
                         help=("Create configuration only.  Do not deploy." +
                               "  Requires --directory."), action='store_true')
@@ -810,7 +915,9 @@ def get_cli_options():
                         default=None)
     parser.add_argument("-f", "--file", "--input-file",
                         help=("YAML file specifying demo parameters.  " +
-                              "Required for undeployment as well."),
+                              "Respected for undeployment as well.  If " +
+                              "present, used instead of environment or " +
+                              "prompt."),
                         default=None)
     parser.add_argument("-u", "--undeploy",
                         help="Undeploy JupyterLab Demo cluster",
@@ -827,7 +934,101 @@ def get_cli_options():
                                       "Respected for undeployment as well." +
                                       "  Requires --existing-cluster."),
         action='store_true')
-    return parser.parse_args()
+    result = parser.parse_args()
+    dtype = "deploy"
+    if "undeploy" in result and result.undeploy:
+        dtype = "undeploy"
+    if "file" not in result or not result.file:
+        result.params = get_options_from_environment()
+        complete = True
+        req_ps = REQUIRED_PARAMETER_NAMES
+        if dtype == "deploy":
+            req_ps = REQUIRED_DEPLOYMENT_PARAMETER_NAMES
+        for n in req_ps:
+            if _empty(result, n):
+                complete = False
+                break
+        if not complete:
+            result.params = get_options_from_user(dtype=dtype,
+                                                  params=result.params)
+        result.params = _canonicalize_result_params(result.params)
+    return result
+
+
+def get_options_from_environment(dtype="deploy"):
+    retval = {}
+    for n in PARAMETER_NAMES:
+        e = os.getenv(ENVIRONMENT_NAMESPACE + n.upper())
+        if e:
+            retval[n] = e
+    if _empty(retval, "tls_cert"):
+        e = os.getenv(ENVIRONMENT_NAMESPACE + "CERTIFICATE_DIRECTORY")
+        if e:
+            do_beats = _empty(retval, "beats_cert")
+            retval.update(_set_certs_from_dir(e, beats=do_beats))
+    return retval
+
+
+def _set_certs_from_dir(d, beats=False):
+    retval = {}
+    retval["tls_cert"] = os.path.join(d, "cert.pem")
+    retval["tls_key"] = os.path.join(d, "key.pem")
+    retval["tls_root_chain"] = os.path.join(d, "chain.pem")
+    dhfile = os.path.join(d, "dhparam.pem")
+    if os.path.exists(dhfile):
+        retval["tls_dhparam"] = dhfile
+    if beats:
+        beats_cert = os.path.join(d, "beats_cert.pem")
+        if os.path.exists(beats_cert):
+            retval["beats_cert"] = beats_cert
+            retval["beats_ca"] = os.path.join(d, "beats_ca.pem")
+            retval["beats_key"] = os.path.join(d, "beats_key.pem")
+    return retval
+
+
+def _canonicalize_result_params(params):
+    wlname = "github_organization_whitelist"
+    if not _empty(params, wlname):
+        params[wlname] = params[wlname].split(',')
+    for intval in ["gke_node_count", "volume_size_gigabytes"]:
+        if not _empty(params, intval):
+            params[intval] = int(params[intval])
+    return params
+
+
+def get_options_from_user(dtype="deploy", params={}):
+    prompts = {"kubernetes_cluster_name": "Kubernetes Cluster Name",
+               "hostname": "JupyterLab Demo hostname (FQDN)",
+               "github_client_id": "GitHub OAuth Client ID",
+               "github_client_secret": "GitHub OAuth Client Secret",
+               "github_organization_whitelist": "GitHub Organization Whitelist"
+               }
+    params.update(_get_values_from_prompt(
+        params, REQUIRED_PARAMETER_NAMES, prompts))
+    if dtype == "deploy":
+        if _empty(params, "tls_cert"):
+            l = ""
+            while not l:
+                l = input("TLS Certificate Directory: ")
+            params.update(_set_certs_from_dir(l))
+        params.update(_get_values_from_prompt(
+            params, REQUIRED_DEPLOYMENT_PARAMETER_NAMES, prompts))
+    return params
+
+
+def _get_values_from_prompt(params, namelist, prompts={}):
+    for n in namelist:
+        if _empty(params, n):
+            l = ""
+            while not l:
+                pr = prompts.get(n) or n
+                l = input(pr + ": ")
+            params[n] = l
+    return params
+
+
+def params_complete(inputdict):
+    return False
 
 
 @contextmanager
@@ -856,7 +1057,8 @@ def _which(program):
         if is_exe(program):
             return program
     else:
-        for path in os.environ["PATH"].split(os.pathsep):
+        ospath = os.getenv("PATH")
+        for path in ospath.split(os.pathsep):
             exe_file = os.path.join(path, program)
             if is_exe(exe_file):
                 return exe_file
@@ -872,12 +1074,14 @@ def standalone_deploy(options):
     e_n = options.existing_namespace
     e_d = options.directory
     c_c = options.create_config
+    p_p = options.params
     deployment = JupyterLabDeployment(yamlfile=y_f,
                                       disable_prepuller=d_p,
                                       existing_cluster=e_c,
                                       existing_namespace=e_n,
                                       directory=e_d,
-                                      config_only=c_c
+                                      config_only=c_c,
+                                      params=p_p
                                       )
     deployment.deploy()
 
@@ -888,9 +1092,11 @@ def standalone_undeploy(options):
     y_f = options.file
     e_c = options.existing_cluster
     e_n = options.existing_namespace
+    p_p = options.params
     deployment = JupyterLabDeployment(yamlfile=y_f,
                                       existing_cluster=e_c,
                                       existing_namespace=e_n,
+                                      params=p_p
                                       )
     deployment.undeploy()
 
@@ -899,6 +1105,10 @@ def standalone():
     logging.basicConfig(format='%(asctime)s %(message)s',
                         datefmt='%m/%d/%Y %I:%M:%S %p',
                         level=logging.DEBUG)
+    try:
+        import readline  # NoQA
+    except ImportError:
+        logging.warn("No readline library found; no elaborate input editing.")
     options = get_cli_options()
     if options.undeploy:
         standalone_undeploy(options)
