@@ -1,5 +1,10 @@
 # Automated JupyterLab Demo Deployment
+## Introduction
+This is a mostly automated deployment of the Jupyterlabdemo for LSST. It assumes you will deploy on a kubernetes
+cluster using `kubectl` so you need the Google Cloud CLI in stalled.
 
+Ultimately this will spin up a full JupyterLab with LSST stack available in the notebooks. The server address must be mapped in DNS - 
+this page suggests using AWS Route 53 for that. 
 ## Basic Usage
 
 If all you want to do is run an LSST JupyterLab Demo environment, hosted
@@ -63,7 +68,7 @@ organizations, the following should get you going.
       the TLS PEM files you got earlier: specify the (local) path to
       them.
 	- `github_client_id` and `github_client_secret` from the OAuth
-      application you created earlier. These hsould be base64 encoded e.g. echo -n $ITEM | base64 -i -
+      application you created earlier. These should be base64 encoded e.g. echo -n $ITEM | base64 -i -
 	- `github_organization_whitelist`: each list entry is a GitHub
       organization name that, if the person logging in is a member of,
       login will be allowed to succeed.

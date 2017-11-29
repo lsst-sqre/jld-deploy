@@ -140,7 +140,7 @@ class JupyterLabDeployment(object):
         for p in proglist:
             rc = _which(p)
             if not rc:
-                raise ValueError("%s not on search path!" % p)
+                raise ValueError("%s not on search path!" %  (p))
             self.executables[p] = rc
 
     def _set_params(self):
@@ -245,7 +245,7 @@ class JupyterLabDeployment(object):
             self.params[
                 'session_db_url'] = 'sqlite:////home/jupyter/jupyterhub.sqlite'
         if self._empty_param('tls_dhparam'):
-            self._check_executable("openssl")
+            self._check_executables(["openssl"])
             if self._empty_param('dhparam_bits'):
                 self.params['dhparam_bits'] = 2048
 
