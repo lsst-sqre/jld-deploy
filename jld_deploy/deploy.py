@@ -46,6 +46,7 @@ import os
 import os.path
 import shutil
 import subprocess
+import string
 import tempfile
 import time
 import yaml
@@ -211,10 +212,19 @@ class JupyterLabDeployment(object):
 
     def _get_cluster_info(self):
         if self._empty_param('kubernetes_cluster_name'):
-            raise ValueError("'kubernetes_cluster_name' must be set.")
+            if not self._empty_param('hostname'):
+                hname = self.params["hostname"]
+                cname = hname.translate({ord('.'): '-'})
+                logging.warn("Using default derived cluster name '%s'" %
+                             cname)
+                self.params["kubernetes_cluster_name"] = cname
+            raise ValueError("'kubernetes_cluster_name' must be set, " +
+                             "either explicitly or from 'hostname'.")
         if self._empty_param('kubernetes_cluster_namespace'):
+            logging.info("Using default cluster namespace 'default'.")
             self.params["kubernetes_cluster_namespace"] = 'default'
         if self._empty_param('gke_zone'):
+            logging.info("Using default gke_zone '%s'." % DEFAULT_GKE_ZONE)
             self.params["gke_zone"] = DEFAULT_GKE_ZONE
 
     def _validate_deployment_params(self):
@@ -241,8 +251,9 @@ class JupyterLabDeployment(object):
         else:
             nfs_sz = "950Mi"
         self.params['nfs_volume_size'] = nfs_sz
-        self.params['github_callback_url'] = \
-            "https://%s/hub/oauth_callback" % self.params['hostname']
+        self.params[
+            'github_callback_url'] = ("https://%s/hub/oauth_callback" %
+                                      self.params['hostname'])
         self.params["github_organization_whitelist"] = ','.join(
             self.params["github_organization_whitelist"])
         self._check_optional()
@@ -997,14 +1008,18 @@ def get_options_from_user(dtype="deploy", params={}):
                "github_client_secret": "GitHub OAuth Client Secret",
                "github_organization_whitelist": "GitHub Organization Whitelist"
                }
-    params.update(_get_values_from_prompt(
-        params, REQUIRED_PARAMETER_NAMES, prompts))
+    params.update(_get_values_from_prompt(params, ['hostname'], prompts))
+    if _empty(params, "kubernetes_cluster_name"):
+        hname = params['hostname']
+        cname = hname.translate({ord('.'): '-'})
+        params["kubernetes_cluster_name"] = cname
+        logging.warn("Using derived cluster name '%s'." % cname)
     if dtype == "deploy":
         if _empty(params, "tls_cert"):
-            l = ""
-            while not l:
-                l = input("TLS Certificate Directory: ")
-            params.update(_set_certs_from_dir(l))
+            line = ""
+            while not line:
+                line = input("TLS Certificate Directory: ")
+            params.update(_set_certs_from_dir(line))
         params.update(_get_values_from_prompt(
             params, REQUIRED_DEPLOYMENT_PARAMETER_NAMES, prompts))
     return params
@@ -1013,11 +1028,11 @@ def get_options_from_user(dtype="deploy", params={}):
 def _get_values_from_prompt(params, namelist, prompts={}):
     for n in namelist:
         if _empty(params, n):
-            l = ""
-            while not l:
+            line = ""
+            while not line:
                 pr = prompts.get(n) or n
-                l = input(pr + ": ")
-            params[n] = l
+                line = input(pr + ": ")
+            params[n] = line
     return params
 
 
@@ -1096,7 +1111,7 @@ def standalone_undeploy(options):
 
 
 def standalone():
-    logging.basicConfig(format='%(asctime)s %(message)s',
+    logging.basicConfig(format='%(levelname)s %(asctime)s |%(message)s',
                         datefmt='%m/%d/%Y %I:%M:%S %p',
                         level=logging.DEBUG)
     try:
