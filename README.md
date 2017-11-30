@@ -2,10 +2,16 @@
 
 ## Basic Usage
 
-If all you want to do is run an LSST JupyterLab Demo environment, hosted
-at Google Kubernetes Engine, whose domain name is hosted in AWS Route
-53, with GitHub authentication against a whitelist of allowed GitHub
-organizations, the following should get you going.
+These instructions should suffice to get you going with an LSST
+JupyterLab Demo environment, where all of the following conditions are
+true.
+
+- The computation is hosted within Google Kubernetes Engine.
+- The domain name is hosted within AWS Route 53.
+- Authentication is done via OAuth against GitHub, and GitHub
+  organization membership is used to determine access control.
+
+Here are the steps you need to perform:
 
 1. Choose a fully-qualified domain name in a domain that you control and
    that is hosted by AWS Route 53.  The FQDN need not exist, as long as

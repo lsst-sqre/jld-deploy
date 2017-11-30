@@ -132,28 +132,22 @@ class JupyterLabDeployment(object):
         in an AWS hosted zone, we want to fail sooner rather than later.
         """
         logging.info("Checking authentication.")
-        gc = "gcloud container clusters get-credentials"
-        checkcmd = {"gke": {"cmd": ["gcloud", "container", "clusters",
-                                    "list"],
-                            "config": "gcloud init"},
-                    "kubectl": {"cmd": ["kubectl", "get", "namespaces"],
-                                "config": gc}
-                    }
-        for c in checkcmd:
-            cmd = checkcmd[c]["cmd"]
-            cfg = checkcmd[c]["config"]
-            rc = self._run(cmd, capture=True, capture_stderr=True, check=False)
-            if rc.returncode != 0:
-                errstr = "%s not correctly configured; try `%s`" % (
-                    c, cfg)
-                raise RuntimeError(errstr)
+        cmd = "gcloud info --format yaml".split()
+        rc = self._run(cmd, capture=True)
+        if rc.returncode == 0:
+            gstruct = yaml.load(rc.stdout.decode('utf-8'))
+            acct = gstruct["config"]["account"]
+            if not acct:
+                raise RuntimeError("gcloud not logged in; " +
+                                   "try 'gcloud init'")
         self.params["zoneid"] = self._get_aws_zone_id()
 
     def _get_aws_zone_id(self):
         hostname = self.params["hostname"]
         domain = '.'.join(hostname.split('.')[1:])
         try:
-            zp = self._run(["aws", "route53", "list-hosted-zones"],
+            zp = self._run(["aws", "route53", "list-hosted-zones",
+                            "--output", "json"],
                            capture=True)
             zones = json.loads(zp.stdout.decode('utf-8'))
             zlist = zones["HostedZones"]
@@ -731,7 +725,7 @@ class JupyterLabDeployment(object):
             json.dump(record, f)
         self._run(["aws", "route53", "change-resource-record-sets",
                    "--hosted-zone-id", zoneid, "--change-batch",
-                   "file://%s" % changeset])
+                   "file://%s" % changeset, "--output", "json"])
 
     def _generate_upsert_dns(self):
         ip = self._waitfor(callback=self._get_external_ip, tries=30)
