@@ -1,19 +1,22 @@
 ### JupyterLabDemo deployment data
 ### Kubernetes parameters
 
-kubernetes_cluster_name: '{{K8S_CLUSTER_NAME}}'
-# namespace defaults to 'default' if not defined
+### Hostname (required)
+# Hostname must be fully-qualified and externally accessible for OAuth
+# callback
+hostname: '{{FQDN}}'
+
+### Kubernetes cluster details 
+# kubernetes_cluster_name: '{{K8S_CLUSTER_NAME}}'
+#  cluster name defaults to hostname with dots changed to dashes.
 # kubernetes_cluster_namespace: '{{K8S_CLUSTER_NAMESPACE}}'
+#  namespace defaults to 'default' if not defined
 
 ### GKE parameters
 # zone: 'us-central-1a'
 # node_count: 2
 # machine_type: 'n1-standard-2'
 
-# Hostname must be fully-qualified and externally accessible for OAuth
-# callback
-hostname: '{{FQDN}}'
-# 
 ### Nginx TLS termination (required)
 tls_cert: '/path/to/cert.pem'
 tls_key:  '/path/to/key.pem'
@@ -24,19 +27,23 @@ tls_root_chain: '/path/to/chain.pem'
 # dhparam_bits defaults to 2048; it is only used if tls_dhparam is
 # unset.
 # dhparam_bits: 2048
+
 ### Fileserver specification
 # This obviously depends on your use case.  Must be an integer at least
 # 2, and GKE caps default volume size at 500.  If you have no idea, go
 # with 20 (the default)
 # volume_size_gigabytes: 20
-### GitHub OAuth application data
+
+### GitHub OAuth application data (required)
 github_client_id: '{{GITHUB_CLIENT_ID}}'
 github_client_secret: '{{GITHUB_CLIENT_SECRET}}'
 github_organization_whitelist:
   - '{{GITHUB_ORG_1}}'
   - '{{GITHUB_ORG_2}}'
+
 ### Session storage location.  Any SQLAlchemy URL will work.
 # session_db_url: 'sqlite:////home/jupyter/jupyterhub.sqlite'
+
 ### Optional for ELK logging
 # beats_cert: '/path/to/beats_cert.pem'
 # beats_ca: '/path/to/beats_ca.pem'
@@ -45,6 +52,7 @@ github_organization_whitelist:
 # rabbitmq_pan_password: 'rmqpw'
 # rabbitmq_target_host: 'rabbitmq'
 # rabbitmq_target_vhost: 'jld'
+
 ### Optional for firefly
 # firefly_admin_password: 'firefly'
 
