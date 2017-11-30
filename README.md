@@ -13,6 +13,7 @@ You can spin up a minimum cluster with a command  like :
 Get your cluster info especially the IP address `kubectl config view`
 
 Setup the DNS entry for your server name you will use below. 
+You will also need to run `aws configure' so the script can access orute53 information.
 
 ## Basic Usage
 
