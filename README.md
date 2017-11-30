@@ -1,10 +1,19 @@
 # Automated JupyterLab Demo Deployment
 ## Introduction
 This is a mostly automated deployment of the Jupyterlabdemo for LSST. It assumes you will deploy on a kubernetes
-cluster using `kubectl` so you need the Google Cloud CLI in stalled.
+cluster using `kubectl` so you need the Google Cloud SDK in stalled.
 
 Ultimately this will spin up a full JupyterLab with LSST stack available in the notebooks. The server address must be mapped in DNS - 
 this page suggests using AWS Route 53 for that. 
+
+Before running deploy you will need to do `gcloud init`  and create a cluster. 
+You can spin up a minimum cluster with a command  like :
+`gcloud container clusters create XXXX --num-nodes=2 --machine-type=n1-standard-2 --zone=us-central1-a`
+
+Get your cluster info especially the IP address `kubectl config view`
+
+Setup the DNS entry for your server name you will use below. 
+
 ## Basic Usage
 
 If all you want to do is run an LSST JupyterLab Demo environment, hosted
